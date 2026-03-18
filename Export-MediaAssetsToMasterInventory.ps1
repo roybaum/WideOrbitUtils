@@ -11,6 +11,23 @@ param(
 
     [string]$OutputFileNamePrefix = 'MasterInventory',
 
+    [string]$WebhookUrl,
+
+    [string]$WebhookToken,
+
+    [ValidateSet('upsert', 'replace')]
+    [string]$WebhookWriteMode = 'upsert',
+
+    [string]$WebhookSheetName = 'Inventory',
+
+    [ValidateRange(1, 5000)]
+    [int]$WebhookBatchSize = 500,
+
+    [ValidateRange(0, 10)]
+    [int]$WebhookMaxRetries = 3,
+
+    [switch]$DisableCsv,
+
     [switch]$PassThru
 )
 
@@ -34,6 +51,79 @@ function Convert-WideOrbitDateTime {
     }
 
     return $Value
+}
+
+function Invoke-MasterInventoryWebhookBatch {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Url,
+
+        [Parameter(Mandatory = $true)]
+        [string]$Token,
+
+        [Parameter(Mandatory = $true)]
+        [object[]]$Rows,
+
+        [Parameter(Mandatory = $true)]
+        [string]$SheetName,
+
+        [Parameter(Mandatory = $true)]
+        [ValidateSet('upsert', 'replace')]
+        [string]$WriteMode,
+
+        [Parameter(Mandatory = $true)]
+        [string]$RunId,
+
+        [Parameter(Mandatory = $true)]
+        [int]$BatchNumber,
+
+        [Parameter(Mandatory = $true)]
+        [int]$BatchCount,
+
+        [Parameter(Mandatory = $true)]
+        [int]$MaxRetries
+    )
+
+    $payload = [ordered]@{
+        token        = $Token
+        sheetName    = $SheetName
+        writeMode    = $WriteMode
+        keyFields    = @('Category', 'Number')
+        runId        = $RunId
+        batchNumber  = $BatchNumber
+        batchCount   = $BatchCount
+        isFirstBatch = ($BatchNumber -eq 1)
+        isLastBatch  = ($BatchNumber -eq $BatchCount)
+        rows         = $Rows
+    }
+
+    $jsonBody = $payload | ConvertTo-Json -Depth 8 -Compress
+
+    $requestParams = @{
+        Uri         = $Url
+        Method      = 'Post'
+        ContentType = 'application/json; charset=utf-8'
+        Body        = $jsonBody
+        ErrorAction = 'Stop'
+    }
+
+    if ((Get-Command Invoke-RestMethod).Parameters.ContainsKey('UseBasicParsing')) {
+        $requestParams.UseBasicParsing = $true
+    }
+
+    for ($attempt = 1; $attempt -le ($MaxRetries + 1); $attempt++) {
+        try {
+            return Invoke-RestMethod @requestParams
+        } catch {
+            if ($attempt -gt $MaxRetries) {
+                throw
+            }
+
+            $delaySeconds = [int][math]::Pow(2, $attempt)
+            Write-Warning "Webhook batch $BatchNumber attempt $attempt failed: $($_.Exception.Message). Retrying in $delaySeconds second(s)."
+            Start-Sleep -Seconds $delaySeconds
+        }
+    }
 }
 
 if (!(Test-Path -Path $OutputDirectory)) {
@@ -106,11 +196,67 @@ if ($rows.Count -eq 0) {
     return
 }
 
-$timestamp = Get-Date -Format 'yyyyMMdd-HHmmss'
-$outputPath = Join-Path -Path $OutputDirectory -ChildPath ('{0}-{1}.csv' -f $OutputFileNamePrefix, $timestamp)
+if (!$DisableCsv) {
+    $timestamp = Get-Date -Format 'yyyyMMdd-HHmmss'
+    $outputPath = Join-Path -Path $OutputDirectory -ChildPath ('{0}-{1}.csv' -f $OutputFileNamePrefix, $timestamp)
 
-$rows | Export-Csv -Path $outputPath -NoTypeInformation -Encoding UTF8
-Write-Output "Exported $($rows.Count) rows to $outputPath"
+    $rows | Export-Csv -Path $outputPath -NoTypeInformation -Encoding UTF8
+    Write-Output "Exported $($rows.Count) rows to $outputPath"
+}
+
+$resolvedWebhookUrl = $WebhookUrl
+if ([string]::IsNullOrWhiteSpace($resolvedWebhookUrl)) {
+    $resolvedWebhookUrl = $env:WO_MASTER_WEBHOOK_URL
+}
+
+$resolvedWebhookToken = $WebhookToken
+if ([string]::IsNullOrWhiteSpace($resolvedWebhookToken)) {
+    $resolvedWebhookToken = $env:WO_MASTER_WEBHOOK_TOKEN
+}
+
+if (![string]::IsNullOrWhiteSpace($resolvedWebhookUrl)) {
+    if ([string]::IsNullOrWhiteSpace($resolvedWebhookToken)) {
+        throw 'Webhook URL is set but webhook token is missing. Set -WebhookToken or WO_MASTER_WEBHOOK_TOKEN.'
+    }
+
+    $runId = [guid]::NewGuid().Guid
+    $batchCount = [int][math]::Ceiling($rows.Count / [double]$WebhookBatchSize)
+
+    for ($batchNumber = 1; $batchNumber -le $batchCount; $batchNumber++) {
+        $startIndex = ($batchNumber - 1) * $WebhookBatchSize
+        $endIndex = [Math]::Min(($startIndex + $WebhookBatchSize - 1), ($rows.Count - 1))
+
+        if ($startIndex -eq $endIndex) {
+            $batchRows = @($rows[$startIndex])
+        } else {
+            $batchRows = @($rows[$startIndex..$endIndex])
+        }
+
+        Write-Verbose "Posting webhook batch $batchNumber/$batchCount with $($batchRows.Count) row(s)"
+
+        $response = Invoke-MasterInventoryWebhookBatch `
+            -Url $resolvedWebhookUrl `
+            -Token $resolvedWebhookToken `
+            -Rows $batchRows `
+            -SheetName $WebhookSheetName `
+            -WriteMode $WebhookWriteMode `
+            -RunId $runId `
+            -BatchNumber $batchNumber `
+            -BatchCount $batchCount `
+            -MaxRetries $WebhookMaxRetries
+
+        if ($null -ne $response) {
+            try {
+                $responseText = $response | ConvertTo-Json -Depth 6 -Compress
+                Write-Verbose ("Webhook response batch {0}: {1}" -f $batchNumber, $responseText)
+            } catch {
+                Write-Verbose "Webhook response batch $batchNumber received."
+            }
+        }
+    }
+
+    Write-Output "Pushed $($rows.Count) rows to webhook in $batchCount batch(es)."
+}
 
 if ($PassThru) {
     $rows
