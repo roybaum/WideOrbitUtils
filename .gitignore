@@ -1,5 +1,6 @@
 # Generated test/export output
 TestExports/
+MasterInventoryExports/
 
 # Local temp/log artifacts
 *.log
