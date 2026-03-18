@@ -1,0 +1,13 @@
+# Normalize text files consistently across platforms
+* text=auto
+
+# Keep script and module sources in LF to avoid CRLF conversion warnings
+*.ps1 text eol=lf
+*.psm1 text eol=lf
+*.psd1 text eol=lf
+
+# Common docs/configs
+*.md text eol=lf
+*.yml text eol=lf
+*.yaml text eol=lf
+*.json text eol=lf
