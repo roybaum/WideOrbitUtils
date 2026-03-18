@@ -1,0 +1,11 @@
+# Generated test/export output
+TestExports/
+
+# Local temp/log artifacts
+*.log
+*.tmp
+*.bak
+
+# OS/editor noise
+Thumbs.db
+.DS_Store
